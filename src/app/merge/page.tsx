@@ -1,7 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useMemo, useRef, useState } from "react";
-import type { WorkBook } from "xlsx";
+import { useEffect, useRef, useState } from "react";
 import {
   CheckCircle2,
   Database,
@@ -30,13 +29,9 @@ import {
 import { vasGrain } from "@/lib/columns";
 import {
   CANONICAL_FIELDS,
-  detectHeaderRow,
   exportVasFile,
   exportVasTemplate,
   guessMapping,
-  readWorkbook,
-  sheetColumns,
-  sheetRows,
   type CanonicalField,
 } from "@/lib/excel";
 import {
@@ -55,7 +50,7 @@ interface PFile {
   id: string;
   name: string;
   size: number;
-  wb: WorkBook;
+  file: File;
   sheets: string[];
   sheet: string;
   headerRow: number;
@@ -94,36 +89,115 @@ function cellString(v: unknown): string {
   return String(v).trim();
 }
 
-function mapFile(f: PFile): MappedRow[] {
+interface MergeResult {
+  out: MappedRow[];
+  dups: number;
+  perFile: { id: string; total: number; valid: number; unknown: number }[];
+  totalRead: number;
+}
+
+const EMPTY_MERGE: MergeResult = { out: [], dups: 0, perFile: [], totalRead: 0 };
+
+async function buildMerge(
+  files: PFile[],
+  registryIds: Set<string>,
+  dedupe: boolean,
+  keep: "first" | "last" | "sum",
+  knownOnly: boolean,
+): Promise<MergeResult> {
   const out: MappedRow[] = [];
-  for (const r of f.rows) {
-    const get = (k?: string) => (k ? r[k] : undefined);
-    // Some VAS summary exports do not contain a date or VAS number.
-    // Use PRODUCT ID as the service key only when no VAS_NUMBER/SERVICE ID exists,
-    // and use the import date when the workbook has no date column.
-    const productId = cellString(get(f.mapping.productId));
-    const serviceId = cellString(get(f.mapping.serviceId) || productId).replace(/\s+/g, "");
-    const rawDate = f.mapping.date ? get(f.mapping.date) : null;
-    const date = rawDate == null || rawDate === "" ? new Date() : parseDateValue(rawDate, f.dateFormat);
-    if (!serviceId || !date) continue;
-    const pricePoint = parseAmount(get(f.mapping.pricePoint));
-    const count = Math.max(0, Math.round(parseAmount(get(f.mapping.count))));
-    let revenue = parseAmount(get(f.mapping.revenue));
-    if (!revenue && pricePoint && count) revenue = round2(pricePoint * count);
-    out.push({
-      date,
-      servicePartner: cellString(get(f.mapping.servicePartner)),
-      serviceId,
-      pricePoint,
-      productId,
-      productName: cellString(get(f.mapping.productName)),
-      transaction: cellString(get(f.mapping.transaction)),
-      count: count || (revenue || pricePoint ? 1 : 0),
-      revenue,
-      file: f.name,
-    });
+  const index = new Map<string, number>();
+  const perFile: MergeResult["perFile"] = [];
+  let dups = 0;
+  let totalRead = 0;
+  let processed = 0;
+  const yieldToBrowser = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  for (const file of files) {
+    const importDate = new Date();
+    let valid = 0;
+    let unknown = 0;
+    totalRead += file.rows.length;
+
+    for (const row of file.rows) {
+      const get = (key?: string) => (key ? row[key] : undefined);
+      const productId = cellString(get(file.mapping.productId));
+      const serviceId = cellString(get(file.mapping.serviceId) || productId).replace(/\s+/g, "");
+      const rawDate = file.mapping.date ? get(file.mapping.date) : null;
+      const date = rawDate == null || rawDate === "" ? importDate : parseDateValue(rawDate, file.dateFormat);
+      processed++;
+
+      if (serviceId && date) {
+        valid++;
+        if (knownOnly && registryIds.size && !registryIds.has(serviceId)) {
+          unknown++;
+        } else {
+          const pricePoint = parseAmount(get(file.mapping.pricePoint));
+          const count = Math.max(0, Math.round(parseAmount(get(file.mapping.count))));
+          let revenue = parseAmount(get(file.mapping.revenue));
+          if (!revenue && pricePoint && count) revenue = round2(pricePoint * count);
+          const mapped: MappedRow = {
+            date,
+            servicePartner: cellString(get(file.mapping.servicePartner)),
+            serviceId,
+            pricePoint,
+            productId,
+            productName: cellString(get(file.mapping.productName)),
+            transaction: cellString(get(file.mapping.transaction)),
+            count: count || (revenue || pricePoint ? 1 : 0),
+            revenue,
+            file: file.name,
+          };
+          const key = vasGrain(mapped);
+          if (dedupe && index.has(key)) {
+            dups++;
+            const existing = index.get(key)!;
+            if (keep === "last") out[existing] = mapped;
+            else if (keep === "sum") {
+              out[existing] = {
+                ...out[existing],
+                count: out[existing].count + mapped.count,
+                revenue: round2(out[existing].revenue + mapped.revenue),
+              };
+            }
+          } else {
+            if (dedupe) index.set(key, out.length);
+            out.push(mapped);
+          }
+        }
+      }
+
+      // Yield regularly so large imports do not monopolize the browser's UI thread.
+      if (processed % 2500 === 0) await yieldToBrowser();
+    }
+    perFile.push({ id: file.id, total: file.rows.length, valid, unknown });
   }
-  return out;
+
+  return { out, dups, perFile, totalRead };
+}
+
+type WorkerParseResult = {
+  sheetNames: string[];
+  sheet: string;
+  headerRow: number;
+  columns: string[];
+  rows: Record<string, unknown>[];
+};
+
+function parseFileInWorker(file: File, sheet?: string, headerRow?: number): Promise<WorkerParseResult> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("../../workers/excel.worker.ts", import.meta.url), { type: "module" });
+    worker.onmessage = (event: MessageEvent<{ ok: boolean; result?: WorkerParseResult; error?: string }>) => {
+      worker.terminate();
+      if (event.data.ok && event.data.result) resolve(event.data.result);
+      else reject(new Error(event.data.error || "Unable to read this workbook."));
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(new Error(event.message || "Excel background worker failed."));
+    };
+    worker.postMessage({ file, sheet, headerRow });
+  });
 }
 
 export default function MergePage() {
@@ -140,6 +214,7 @@ export default function MergePage() {
   const [deleteDs, setDeleteDs] = useState<Dataset | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
+  const pushToast = toast.push;
 
   const registry = useApi<{ rows: { serviceId: string }[] }>("/api/services?lite=1");
   const datasets = useApi<{ rows: Dataset[] }>("/api/datasets");
@@ -148,50 +223,66 @@ export default function MergePage() {
     const arr = Array.from(list);
     if (!arr.length) return;
     setAdding(true);
-    for (const file of arr) {
-      try {
-        const wb = await readWorkbook(file);
-        const sheet = wb.SheetNames[0];
-        const headerRow = detectHeaderRow(wb, sheet);
-        const columns = sheetColumns(wb, sheet, headerRow);
-        const rows = sheetRows(wb, sheet, headerRow);
-        setFiles((fs) => [
-          ...fs,
-          {
-            id: `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            name: file.name,
-            size: file.size,
-            wb,
-            sheets: wb.SheetNames,
-            sheet,
-            headerRow,
-            dateFormat: "auto",
-            columns,
-            rows,
-            mapping: guessMapping(columns),
-          },
-        ]);
-      } catch {
-        toast.push({ tone: "error", title: `Could not read ${file.name}`, desc: "Supported formats: .xlsx, .xls, .csv" });
+    try {
+      for (const file of arr) {
+        try {
+          // Excel parsing runs in a Web Worker so large workbooks do not block the UI.
+          const parsed = await parseFileInWorker(file);
+          setFiles((fs) => [
+            ...fs,
+            {
+              id: `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              name: file.name,
+              size: file.size,
+              file,
+              sheets: parsed.sheetNames,
+              sheet: parsed.sheet,
+              headerRow: parsed.headerRow,
+              dateFormat: "auto",
+              columns: parsed.columns,
+              rows: parsed.rows,
+              mapping: guessMapping(parsed.columns),
+            },
+          ]);
+        } catch (error) {
+          toast.push({
+            tone: "error",
+            title: `Could not read ${file.name}`,
+            desc: error instanceof Error ? error.message : "Supported formats: .xlsx, .xls, .csv",
+          });
+        }
       }
+    } finally {
+      setAdding(false);
     }
-    setAdding(false);
   };
 
-  const updateFile = (id: string, patch: Partial<PFile>) => {
-    setFiles((fs) =>
-      fs.map((f) => {
-        if (f.id !== id) return f;
-        const next = { ...f, ...patch };
-        if (patch.sheet !== undefined || patch.headerRow !== undefined) {
-          const hr = next.headerRow;
-          next.columns = sheetColumns(next.wb, next.sheet, hr);
-          next.rows = sheetRows(next.wb, next.sheet, hr);
-          next.mapping = guessMapping(next.columns);
-        }
-        return next;
-      }),
-    );
+  const updateFile = async (id: string, patch: Partial<PFile>) => {
+    const current = files.find((file) => file.id === id);
+    if (!current) return;
+    const nextSheet = patch.sheet ?? current.sheet;
+    const nextHeaderRow = patch.headerRow ?? current.headerRow;
+    if (patch.sheet !== undefined || patch.headerRow !== undefined) {
+      setAdding(true);
+      try {
+        const parsed = await parseFileInWorker(current.file, nextSheet, nextHeaderRow);
+        setFiles((fs) => fs.map((file) => file.id !== id ? file : {
+          ...file,
+          ...patch,
+          sheet: parsed.sheet,
+          headerRow: parsed.headerRow,
+          columns: parsed.columns,
+          rows: parsed.rows,
+          mapping: guessMapping(parsed.columns),
+        }));
+      } catch (error) {
+        toast.push({ tone: "error", title: "Could not update worksheet", desc: error instanceof Error ? error.message : "Please try again." });
+      } finally {
+        setAdding(false);
+      }
+      return;
+    }
+    setFiles((fs) => fs.map((file) => file.id === id ? { ...file, ...patch } : file));
   };
 
   const setMapping = (fileId: string, field: CanonicalField, col: string) => {
@@ -200,45 +291,36 @@ export default function MergePage() {
     );
   };
 
-  const merge = useMemo(() => {
-    const registrySet = new Set((registry.data?.rows ?? []).map((r) => r.serviceId));
-    const perFile: { id: string; total: number; valid: number; unknown: number }[] = [];
-    const out: MappedRow[] = [];
-    const index = new Map<string, number>();
-    let dups = 0;
-    let totalRead = 0;
-    for (const f of files) {
-      const mapped = mapFile(f);
-      totalRead += f.rows.length;
-      let unknown = 0;
-      for (const r of mapped) {
-        if (knownOnly && registrySet.size && !registrySet.has(r.serviceId)) {
-          unknown++;
-          continue;
-        }
-        const key = vasGrain(r);
-        if (dedupe) {
-          const existing = index.get(key);
-          if (existing != null) {
-            dups++;
-            if (keep === "last") out[existing] = r;
-            else if (keep === "sum") {
-              out[existing] = {
-                ...out[existing],
-                count: out[existing].count + r.count,
-                revenue: round2(out[existing].revenue + r.revenue),
-              };
-            }
-            continue;
-          }
-          index.set(key, out.length);
-        }
-        out.push(r);
-      }
-      perFile.push({ id: f.id, total: f.rows.length, valid: mapped.length, unknown });
+  const [merge, setMerge] = useState<MergeResult>(EMPTY_MERGE);
+  const [merging, setMerging] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMerging(files.length > 0);
+    if (!files.length) {
+      setMerge(EMPTY_MERGE);
+      setMerging(false);
+      return () => { cancelled = true; };
     }
-    return { out, dups, perFile, totalRead };
-  }, [files, dedupe, keep, knownOnly, registry.data]);
+
+    const registryIds = new Set((registry.data?.rows ?? []).map((row) => row.serviceId));
+    void buildMerge(files, registryIds, dedupe, keep, knownOnly)
+      .then((next) => {
+        if (!cancelled) setMerge(next);
+      })
+      .catch((error) => {
+        if (!cancelled) pushToast({
+          tone: "error",
+          title: "Could not prepare merge",
+          desc: error instanceof Error ? error.message : "Please check the uploaded workbook.",
+        });
+      })
+      .finally(() => {
+        if (!cancelled) setMerging(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [files, dedupe, keep, knownOnly, registry.data, pushToast]);
 
   const fullyMapped = files.filter((f) => (f.mapping.serviceId || f.mapping.productId) && (f.mapping.revenue || f.mapping.pricePoint)).length;
 
@@ -543,17 +625,17 @@ export default function MergePage() {
                   />
                 </Field>
                 <div className="grid grid-cols-2 gap-2">
-                  <Stat label="Rows read" value={num(merge.totalRead)} />
+                  <Stat label="Rows read" value={merging ? "Processing…" : num(merge.totalRead)} />
                   <Stat label="Mappable" value={num(merge.perFile.reduce((a, p) => a + p.valid, 0))} />
                   <Stat label="Duplicates removed" value={num(merge.dups)} tone="amber" />
                   <Stat label="Final rows" value={num(merge.out.length)} tone="green" />
                 </div>
                 {committing && <ProgressBar value={progress} />}
                 <div className="flex flex-wrap gap-2">
-                  <Button variant="primary" size="md" icon={GitMerge} onClick={commit} disabled={committing || !merge.out.length}>
-                    {committing ? `Committing ${progress}%` : `Commit merge (${num(merge.out.length)})`}
+                  <Button variant="primary" size="md" icon={GitMerge} onClick={commit} disabled={committing || merging || !merge.out.length}>
+                    {committing ? `Committing ${progress}%` : merging ? "Preparing merge…" : `Commit merge (${num(merge.out.length)})`}
                   </Button>
-                  <Button size="md" onClick={exportPreview} disabled={!merge.out.length}>
+                  <Button size="md" onClick={exportPreview} disabled={merging || !merge.out.length}>
                     Export Excel
                   </Button>
                 </div>
