@@ -57,7 +57,12 @@ function findLastPopulatedRow(
   return firstDataRow - 1;
 }
 
-const workerScope = self as unknown as DedicatedWorkerGlobalScope;
+type WorkerScope = {
+  onmessage: ((event: MessageEvent<ParseRequest>) => void) | null;
+  postMessage: (message: unknown) => void;
+};
+
+const workerScope = self as unknown as WorkerScope;
 
 workerScope.onmessage = async (event: MessageEvent<ParseRequest>) => {
   try {
